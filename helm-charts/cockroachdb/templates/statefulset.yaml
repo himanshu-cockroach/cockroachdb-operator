@@ -41,44 +41,26 @@ spec:
       annotations: {{- toYaml . | nindent 8 }}
     {{- end }}
     spec:
-    {{- if or .Values.image.credentials (and .Values.tls.enabled .Values.tls.init.image.credentials (not .Values.tls.certs.provided)) }}
+    {{- if or .Values.image.credentials (and .Values.tls.enabled .Values.tls.selfSigner.image.credentials (not .Values.tls.certs.provided) (not .Values.tls.certs.certManager)) }}
       imagePullSecrets:
       {{- if .Values.image.credentials }}
         - name: {{ template "cockroachdb.fullname" . }}.db.registry
       {{- end }}
-      {{- if and .Values.tls.enabled .Values.tls.init.image.credentials (not .Values.tls.certs.provided) }}
-        - name: {{ template "cockroachdb.fullname" . }}.init-certs.registry
+      {{- if and .Values.tls.enabled .Values.tls.selfSigner.image.credentials (not .Values.tls.certs.provided) (not .Values.tls.certs.certManager) }}
+        - name: {{ template "cockroachdb.fullname" . }}.self-signed-certs.registry
       {{- end }}
     {{- end }}
     {{- if .Values.tls.enabled }}
       serviceAccountName: {{ template "cockroachdb.tls.serviceAccount.name" . }}
-      {{- if not .Values.tls.certs.provided }}
+      {{- if .Values.tls.enabled }}
       initContainers:
-        # The init-certs container sends a CSR (certificate signing request) to
-        # the Kubernetes cluster.
-        # You can see pending requests using:
-        #   kubectl get csr
-        # CSRs can be approved using:
-        #   kubectl certificate approve <csr-name>
-        #
-        # All addresses used to contact a Node must be specified in the
-        # `--addresses` arg.
-        #
-        # In addition to the Node certificate and key, the init-certs entrypoint
-        # will symlink the cluster CA to the certs directory.
-        - name: init-certs
-          image: "{{ .Values.tls.init.image.repository }}:{{ .Values.tls.init.image.tag }}"
-          imagePullPolicy: {{ .Values.tls.init.image.pullPolicy | quote }}
+        - name: copy-certs
+          image: {{ .Values.tls.copyCerts.image | quote }}
+          imagePullPolicy: {{ .Values.tls.selfSigner.image.pullPolicy | quote }}
           command:
-            - /bin/ash
-            - -ecx
-            - >-
-              /request-cert
-              -namespace=${POD_NAMESPACE}
-              -certs-dir=/cockroach-certs/
-              -symlink-ca-from=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-              -type=node
-              -addresses=localhost,127.0.0.1,$(hostname -f),$(hostname -f|cut -f 1-2 -d '.'),{{ template "cockroachdb.fullname" . }}-public,{{ template "cockroachdb.fullname" . }}-public.$(hostname -f|cut -f 3- -d '.')
+            - /bin/sh
+            - -c
+            - "cp -f /certs/* /cockroach-certs/; chmod 0400 /cockroach-certs/*.key"
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -87,6 +69,11 @@ spec:
           volumeMounts:
             - name: certs
               mountPath: /cockroach-certs/
+            - name: certs-secret
+              mountPath: /certs/
+        {{- with .Values.tls.copyCerts.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+        {{- end }}
       {{- end }}
     {{- end }}
     {{- if or .Values.statefulset.nodeAffinity .Values.statefulset.podAffinity .Values.statefulset.podAntiAffinity }}
@@ -128,7 +115,7 @@ spec:
         {{- end }}
       {{- end }}
     {{- end }}
-    {{- if semverCompare ">=1.16-0" .Capabilities.KubeVersion.GitVersion }}
+    {{- if semverCompare ">=1.16-0" .Capabilities.KubeVersion.Version }}
       topologySpreadConstraints:
       - labelSelector:
           matchLabels:
@@ -192,7 +179,6 @@ spec:
                   ${STATEFULSET_NAME}-{{ $i }}.${STATEFULSET_FQDN}:{{ $.Values.service.ports.grpc.internal.port | int64 -}}
                 {{- end -}}
               {{- end }}
-              --advertise-host=$(hostname).${STATEFULSET_FQDN}
             {{- with index .Values.conf `cluster-name` }}
               --cluster-name={{ . }}
             {{- if index $.Values.conf `disable-cluster-name-verification` }}
@@ -200,7 +186,7 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
-              --logtostderr={{ .Values.conf.logtostderr }}
+              --advertise-host=$(hostname).${STATEFULSET_FQDN}
             {{- if .Values.tls.enabled }}
               --certs-dir=/cockroach/cockroach-certs/
             {{- else }}
@@ -225,6 +211,14 @@ spec:
             {{- with index .Values.conf `sql-audit-dir` }}
               --sql-audit-dir={{ . }}
             {{- end }}
+            {{- if .Values.conf.store.enabled }}
+              --store={{ template "cockroachdb.conf.store" . }}
+            {{- end }}
+            {{- if .Values.conf.log.enabled }}
+              --log-config-file=/cockroach/log-config/log-config.yaml
+            {{- else }}
+              --logtostderr={{ .Values.conf.logtostderr }}
+            {{- end }}
             {{- range .Values.statefulset.args }}
               {{ . }}
             {{- end }}
@@ -247,17 +241,29 @@ spec:
               protocol: TCP
           volumeMounts:
             - name: datadir
-              mountPath: /cockroach/cockroach-data/
+              mountPath: /cockroach/{{ .Values.conf.path }}/
           {{- if .Values.tls.enabled }}
             - name: certs
               mountPath: /cockroach/cockroach-certs/
+              {{- if .Values.tls.certs.provided }}
+            - name: certs-secret
+              mountPath: /cockroach/certs/
+              {{- end }}
           {{- end }}
           {{- range .Values.statefulset.secretMounts }}
             - name: {{ printf "secret-%s" . | quote }}
               mountPath: {{ printf "/etc/cockroach/secrets/%s" . | quote }}
               readOnly: true
           {{- end }}
+          {{- if .Values.conf.log.enabled }}
+            - name: log-config
+              mountPath: /cockroach/log-config
+              readOnly: true
+          {{- end }}
           livenessProbe:
+          {{- if .Values.statefulset.customLivenessProbe }}
+            {{ toYaml .Values.statefulset.customLivenessProbe | nindent 12 }}
+          {{- else }}
             httpGet:
               path: /health
               port: http
@@ -266,7 +272,11 @@ spec:
             {{- end }}
             initialDelaySeconds: 30
             periodSeconds: 5
+          {{- end }}
           readinessProbe:
+          {{- if .Values.statefulset.customReadinessProbe }}
+            {{ toYaml .Values.statefulset.customReadinessProbe | nindent 12 }}
+          {{- else }}
             httpGet:
               path: /health?ready=1
               port: http
@@ -276,6 +286,7 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 5
             failureThreshold: 2
+          {{- end }}
         {{- with .Values.statefulset.resources }}
           resources: {{- toYaml . | nindent 12 }}
         {{- end }}
@@ -292,35 +303,44 @@ spec:
         {{- end }}
       {{- if .Values.tls.enabled }}
         - name: certs
-          {{- if .Values.tls.certs.provided }}
-          {{- if .Values.tls.certs.tlsSecret }}
+          emptyDir: {}
+          {{- if or .Values.tls.certs.provided .Values.tls.certs.certManager  .Values.tls.certs.selfSigner.enabled }}
+        - name: certs-secret
+          {{- if or .Values.tls.certs.tlsSecret .Values.tls.certs.certManager .Values.tls.certs.selfSigner.enabled }}
           projected:
             sources:
             - secret:
+                {{- if .Values.tls.certs.selfSigner.enabled }}
+                name: {{ template "cockroachdb.fullname" . }}-node-secret
+                {{ else }}
                 name: {{ .Values.tls.certs.nodeSecret }}
+                {{ end -}}
                 items:
                 - key: ca.crt
                   path: ca.crt
-                  mode: 0400
+                  mode: 256
                 - key: tls.crt
                   path: node.crt
-                  mode: 0400
+                  mode: 256
                 - key: tls.key
                   path: node.key
-                  mode: 0400
+                  mode: 256
           {{- else }}
           secret:
             secretName: {{ .Values.tls.certs.nodeSecret }}
-            defaultMode: 0400
+            defaultMode: 256
           {{- end }}
-          {{- else }}
-          emptyDir: {}
           {{- end }}
       {{- end }}
       {{- range .Values.statefulset.secretMounts }}
         - name: {{ printf "secret-%s" . | quote }}
           secret:
             secretName: {{ . | quote }}
+      {{- end }}
+      {{- if .Values.conf.log.enabled }}
+        - name: log-config
+          secret:
+            secretName: {{ template "cockroachdb.fullname" . }}-log-config
       {{- end }}
 {{- if .Values.storage.persistentVolume.enabled }}
   volumeClaimTemplates:

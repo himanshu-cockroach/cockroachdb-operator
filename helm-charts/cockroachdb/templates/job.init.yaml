@@ -1,4 +1,7 @@
-{{- if and (eq (len .Values.conf.join) 0) (not (index .Values.conf `single-node`)) }}
+{{ $isClusterInitEnabled := and (eq (len .Values.conf.join) 0) (not (index .Values.conf `single-node`)) }}
+{{ $isDatabaseProvisioningEnabled := .Values.init.provisioning.enabled }}
+{{- if or $isClusterInitEnabled $isDatabaseProvisioningEnabled }}
+  {{ template "cockroachdb.tlsValidation" . }}
 kind: Job
 apiVersion: batch/v1
 metadata:
@@ -15,6 +18,12 @@ metadata:
   {{- with .Values.labels }}
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- with .Values.init.jobAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   template:
     metadata:
@@ -30,40 +39,25 @@ spec:
     spec:
       restartPolicy: OnFailure
       terminationGracePeriodSeconds: 0
-    {{- if or .Values.image.credentials (and .Values.tls.enabled .Values.tls.init.image.credentials (not .Values.tls.certs.provided)) }}
+    {{- if or .Values.image.credentials (and .Values.tls.enabled .Values.tls.selfSigner.image.credentials (not .Values.tls.certs.provided) (not .Values.tls.certs.certManager)) }}
       imagePullSecrets:
       {{- if .Values.image.credentials }}
         - name: {{ template "cockroachdb.fullname" . }}.db.registry
       {{- end }}
-      {{- if and .Values.tls.enabled .Values.tls.init.image.credentials (not .Values.tls.certs.provided) }}
-        - name: {{ template "cockroachdb.fullname" . }}.init-certs.registry
+      {{- if and .Values.tls.enabled .Values.tls.selfSigner.image.credentials (not .Values.tls.certs.provided) (not .Values.tls.certs.certManager) }}
+        - name: {{ template "cockroachdb.fullname" . }}.self-signed-certs.registry
       {{- end }}
     {{- end }}
-    {{- if and .Values.tls.enabled (not .Values.tls.certs.provided)}}
+    {{- if .Values.tls.enabled }}
       serviceAccountName: {{ template "cockroachdb.tls.serviceAccount.name" . }}
       initContainers:
-        # The init-certs container sends a CSR (certificate signing request) to
-        # the Kubernetes cluster.
-        # You can see pending requests using:
-        #   kubectl get csr
-        # CSRs can be approved using:
-        #   kubectl certificate approve <csr-name>
-        #
-        # In addition to the Node certificate and key, the init-certs entrypoint
-        # will symlink the cluster CA to the certs directory.
-        - name: init-certs
-          image: "{{ .Values.tls.init.image.repository }}:{{ .Values.tls.init.image.tag }}"
-          imagePullPolicy: {{ .Values.tls.init.image.pullPolicy | quote }}
+        - name: copy-certs
+          image: {{ .Values.tls.copyCerts.image | quote }}
+          imagePullPolicy: {{ .Values.tls.selfSigner.image.pullPolicy | quote }}
           command:
-            - /bin/ash
-            - -ecx
-            - >-
-              /request-cert
-              -namespace=${POD_NAMESPACE}
-              -certs-dir=/cockroach-certs/
-              -symlink-ca-from=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-              -type=client
-              -user=root
+            - /bin/sh
+            - -c
+            - "cp -f /certs/* /cockroach-certs/; chmod 0400 /cockroach-certs/*.key"
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -72,6 +66,11 @@ spec:
           volumeMounts:
             - name: client-certs
               mountPath: /cockroach-certs/
+            - name: certs-secret
+              mountPath: /certs/
+      {{- with .Values.tls.copyCerts.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+      {{- end }}
     {{- end }}
     {{- with .Values.init.affinity }}
       affinity: {{- toYaml . | nindent 8 }}
@@ -95,29 +94,137 @@ spec:
           # Command completes either when cluster initialization succeeds,
           # or when cluster has been initialized already.
           command:
-            - /bin/bash
-            - -c
-            - >-
-              while true; do
-              initOUT=$(set -x;
-              /cockroach/cockroach init
-              {{- if .Values.tls.enabled }}
-              --certs-dir=/cockroach-certs/
-              {{- else }}
-              --insecure
-              {{- end }}
-              {{- with index .Values.conf "cluster-name" }}
-              --cluster-name={{.}}
-              {{- end }}
-              --host={{ template "cockroachdb.fullname" . }}-0.{{ template "cockroachdb.fullname" . -}}
-                     :{{ .Values.service.ports.grpc.internal.port | int64 }}
-              2>&1);
-              initRC="$?";
-              echo $initOUT;
-              [[ "$initRC" == "0" ]] && exit 0;
-              [[ "$initOUT" == *"cluster has already been initialized"* ]] && exit 0;
-              sleep 5;
-              done
+          - /bin/bash
+          - -c
+          - >-
+            {{- if $isClusterInitEnabled }}
+              initCluster() {
+                while true; do
+                  local output=$(
+                    set -x;
+
+                    /cockroach/cockroach init \
+                      {{- if .Values.tls.enabled }}
+                      --certs-dir=/cockroach-certs/ \
+                      {{- else }}
+                      --insecure \
+                      {{- end }}
+                      {{- with index .Values.conf "cluster-name" }}
+                      --cluster-name={{.}} \
+                      {{- end }}
+                      --host={{ template "cockroachdb.fullname" . }}-0.{{ template "cockroachdb.fullname" . -}}
+                              :{{ .Values.service.ports.grpc.internal.port | int64 }}
+                  2>&1);
+
+                  local exitCode="$?";
+                  echo $output;
+
+                  if [[ "$exitCode" == "0" || "$output" == *"cluster has already been initialized"* ]]
+                    then break;
+                  fi
+
+                  sleep 5;
+                done
+              }
+
+              initCluster;
+            {{- end }}
+
+            {{- if $isDatabaseProvisioningEnabled }}
+              provisionCluster() {
+                while true; do
+                  /cockroach/cockroach sql \
+                    {{- if .Values.tls.enabled }}
+                    --certs-dir=/cockroach-certs/ \
+                    {{- else }}
+                    --insecure \
+                    {{- end }}
+                    --host={{ template "cockroachdb.fullname" . }}-0.{{ template "cockroachdb.fullname" . -}}
+                            :{{ .Values.service.ports.grpc.internal.port | int64 }} \
+                    --execute="
+                      {{- range $clusterSetting, $clusterSettingValue := .Values.init.provisioning.clusterSettings }}
+                        SET CLUSTER SETTING {{ $clusterSetting }} = '${{ $clusterSetting | replace "." "_" }}_CLUSTER_SETTING';
+                      {{- end }}
+
+                      {{- range $user := .Values.init.provisioning.users }}
+                        CREATE USER IF NOT EXISTS {{ $user.name }} WITH
+                        {{- if $user.password }}
+                          PASSWORD '${{ $user.name }}_PASSWORD'
+                        {{- else }}
+                          PASSWORD null
+                        {{- end }}
+                          {{ join " " $user.options }}
+                        ;
+                      {{- end }}
+
+                      {{- range $database := .Values.init.provisioning.databases }}
+                        CREATE DATABASE IF NOT EXISTS {{ $database.name }}
+                          {{- if $database.options }}
+                            {{ join " " $database.options }}
+                          {{- end }}
+                        ;
+
+                      {{- range $owner := $database.owners }}
+                        GRANT ALL ON DATABASE {{ $database.name }} TO {{ $owner }};
+                      {{- end }}
+
+                      {{- if $database.backup }}
+                        CREATE SCHEDULE IF NOT EXISTS {{ $database.name }}_scheduled_backup
+                          FOR BACKUP DATABASE {{ $database.name }} INTO '{{ $database.backup.into }}'
+
+                        {{- if $database.backup.options }}
+                          WITH {{ join "," $database.backup.options }}
+                        {{- end }}
+                          RECURRING '{{ $database.backup.recurring }}'
+                        {{- if $database.backup.fullBackup }}
+                          FULL BACKUP '{{ $database.backup.fullBackup }}'
+                        {{- else }}
+                          FULL BACKUP ALWAYS
+                        {{- end }}
+
+                        {{- if and $database.backup.schedule $database.backup.schedule.options }}
+                          WITH SCHEDULE OPTIONS {{ join "," $database.backup.schedule.options }}
+                        {{- end }}
+                        ;
+                      {{- end }}
+                      {{- end }}
+                    "
+                  &>/dev/null;
+
+                  local exitCode="$?";
+
+                  if [[ "$exitCode" == "0" ]]
+                    then break;
+                  fi
+
+                  sleep 5;
+                done
+
+                echo "Provisioning completed successfully";
+              }
+
+              provisionCluster;
+            {{- end }}
+          env:
+        {{- $secretName := printf "%s-init" (include "cockroachdb.fullname" .) }}
+        {{- range $user := .Values.init.provisioning.users }}
+        {{- if $user.password }}
+          - name: {{ $user.name }}_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: {{ $secretName }}
+                key: {{ $user.name }}-password
+        {{- end }}
+        {{- end }}
+        {{- range $clusterSetting, $clusterSettingValue := .Values.init.provisioning.clusterSettings }}
+        {{- if $clusterSettingValue }}
+          - name: {{ $clusterSetting | replace "." "_" }}_CLUSTER_SETTING
+            valueFrom:
+              secretKeyRef:
+                name: {{ $secretName }}
+                key: {{ $clusterSetting | replace "." "-" }}-cluster-setting
+        {{- end }}
+        {{- end }}
         {{- if .Values.tls.enabled }}
           volumeMounts:
             - name: client-certs
@@ -129,12 +236,18 @@ spec:
     {{- if .Values.tls.enabled }}
       volumes:
         - name: client-certs
-          {{- if .Values.tls.certs.provided }}
-          {{- if .Values.tls.certs.tlsSecret }}
+          emptyDir: {}
+          {{- if or .Values.tls.certs.provided .Values.tls.certs.certManager .Values.tls.certs.selfSigner.enabled }}
+        - name: certs-secret
+          {{- if or .Values.tls.certs.tlsSecret .Values.tls.certs.certManager .Values.tls.certs.selfSigner.enabled }}
           projected:
             sources:
             - secret:
+                {{- if .Values.tls.certs.selfSigner.enabled }}
+                name: {{ template "cockroachdb.fullname" . }}-client-secret
+                {{ else }}
                 name: {{ .Values.tls.certs.clientRootSecret }}
+                {{ end -}}
                 items:
                 - key: ca.crt
                   path: ca.crt
@@ -150,8 +263,6 @@ spec:
             secretName: {{ .Values.tls.certs.clientRootSecret }}
             defaultMode: 0400
           {{- end }}
-          {{- else }}
-          emptyDir: {}
           {{- end }}
     {{- end }}
 {{- end }}
